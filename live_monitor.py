@@ -1,0 +1,476 @@
+SAFE_SPECIES = ["rosella", "king_parrot", "lorikeet", "rainbow_lorikeet", "kookaburra", "magpie"]
+
+def send_telegram_alert(image_path, caption=""):
+    token = "8542046011:AAGixULwPxZWBesqY2jjI7XndeKMbA67Avk"
+    chat_id = "7087305671"
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    try:
+        with open(image_path, "rb") as f:
+            requests.post(url, data={"chat_id": chat_id, "caption": caption}, files={"photo": f}, timeout=10)
+    except Exception as e:
+        print(f"[TELEGRAM ERROR] {e}", flush=True)
+
+
+def trigger_bhyve():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(("127.0.0.1", 9999))
+        s.sendall(b"TRIGGER\n")
+        s.close()
+        print("[TRIGGER] Sent spray burst to bhyve daemon.", flush=True)
+    except Exception as e:
+        print(f"[TRIGGER ERROR] {e}", flush=True)
+
+import time
+import subprocess
+
+def display_on_desktop(image_path):
+    """Displays the hit image directly on the Pi desktop GUI from systemd."""
+    def _show():
+        try:
+            # Kill previous feh popups to keep the screen clean
+            subprocess.run(["pkill", "-f", "feh --geometry"], stderr=subprocess.DEVNULL)
+            
+            # Export X11 display environment variables for the desktop session
+            env = os.environ.copy()
+            env["DISPLAY"] = ":0"
+            # Find the active user Xauthority cookie
+            xauth_path = os.path.expanduser("~/.Xauthority")
+            if os.path.exists(xauth_path):
+                env["XAUTHORITY"] = xauth_path
+            
+            # Launch feh borderless, scaled, auto-closing after 15 seconds
+            cmd = [
+                "feh",
+                "--geometry", "800x600",
+                "--scale-down",
+                "--auto-zoom",
+                "--title", "BIRD ALERT",
+                image_path
+            ]
+            subprocess.Popen(cmd, env=env)
+        except Exception as err:
+            print(f"[DISPLAY ERROR] Could not show desktop image: {err}", flush=True)
+
+    threading.Thread(target=_show, daemon=True).start()
+
+import os
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+import sys
+import time
+import json
+import socket
+import threading
+import requests
+import websocket
+import cv2
+import numpy as np
+from datetime import datetime
+from ultralytics import YOLO
+
+# --- LOAD CREDENTIALS (.env) ---
+env_path = os.path.expanduser("~/cockatoo_project/.env")
+creds = {}
+if os.path.exists(env_path):
+    with open(env_path) as f:
+        for line in f:
+            if "=" in line and not line.startswith("#"):
+                k, v = line.strip().split("=", 1)
+                creds[k] = v
+
+BHYVE_EMAIL = creds.get("BHYVE_EMAIL")
+BHYVE_PASSWORD = creds.get("BHYVE_PASSWORD")
+DEVICE_ID = creds.get("BHYVE_DEVICE_ID")
+STATION = int(creds.get("BHYVE_STATION", 3))
+BURST_SECONDS = float(creds.get("BURST_SECONDS", 3.0))
+
+TAPO_USER = creds.get("TAPO_USER", "cockatoo")
+TAPO_PASS = creds.get("TAPO_PASS", "cockatoo1234")
+TAPO_IP   = creds.get("TAPO_IP", "192.168.1.147")
+RTSP_URL  = f"rtsp://{TAPO_USER}:{TAPO_PASS}@{TAPO_IP}:554/stream2"
+
+VM_TOKEN  = creds.get("VM_TOKEN", "7db97-fcb6c-b3baf-45713-910ce-9a234-0f-0d55d606-c50d-4921-a2f2-c524cc2d115b")
+VM_DEVICE = creds.get("VM_DEVICE", "bad-bird-kitchen-echo-pyowk")
+
+# --- DETECTION THRESHOLDS ---
+CONF_THRESHOLD   = 0.42
+MIN_BIRD_DIM     = 35   # Catch small birds for safe logging
+TARGET_MIN_DIM   = 95
+COOLDOWN_SECONDS = 15
+FEEDER_ZONE      = (0.31, 0.42, 0.68, 0.78)
+
+# --- B-HYVE WEBSOCKET CLIENT ---
+class BHyveClient:
+    def __init__(self):
+        self.ws = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.is_connected = False
+        threading.Thread(target=self._connection_loop, daemon=True).start()
+
+    def _get_token(self):
+        try:
+            res = requests.post(
+                "https://api.orbitbhyve.com/v1/session",
+                json={"session": {"email": BHYVE_EMAIL, "password": BHYVE_PASSWORD}},
+                headers={"orbit-app-id": "Orbit Support Dashboard", "Content-Type": "application/json"},
+                timeout=15
+            )
+            if res.status_code == 200:
+                return res.json().get("orbit_api_key")
+        except Exception as e:
+            print(f"[B-HYVE AUTH ERROR] {e}", flush=True)
+        return None
+
+    def _connection_loop(self):
+        while self.running:
+            token = self._get_token()
+            if not token:
+                time.sleep(10)
+                continue
+
+            ws_url = f"wss://api.orbitbhyve.com/v1/events?token={token}"
+            try:
+                with self.lock:
+                    self.ws = websocket.create_connection(ws_url, timeout=10)
+                    # Complete mandatory Orbit app handshake
+                    handshake = {"event": "app_connection", "orbit_session_token": token}
+                    self.ws.send(json.dumps(handshake))
+                    if hasattr(self, 'device_id') and self.device_id:
+                        self.ws.send(json.dumps({"event": "subscribe", "devices": [self.device_id]}))
+                    self.is_connected = True
+                    print("[B-HYVE] WebSocket connected, handshaked, and ready.", flush=True)
+
+                def _heartbeat():
+                    while self.running and self.is_connected:
+                        time.sleep(20)
+                        try:
+                            with self.lock:
+                                if self.is_connected and self.ws:
+                                    self.ws.send(json.dumps({"event": "ping"}))
+                        except Exception:
+                            break
+
+                threading.Thread(target=_heartbeat, daemon=True).start()
+
+                while self.running and self.is_connected:
+                    try:
+                        self.ws.settimeout(30.0)
+                        msg = self.ws.recv()
+                        if not msg:
+                            break
+                    except (websocket.WebSocketTimeoutException, socket.timeout):
+                        continue
+                    except Exception:
+                        break
+
+            except Exception as e:
+                print(f"[B-HYVE CONN ERROR] {e}", flush=True)
+
+            with self.lock:
+                self.is_connected = False
+                if self.ws:
+                    try:
+                        self.ws.close()
+                    except Exception:
+                        pass
+                    self.ws = None
+            time.sleep(5)
+
+    def trigger_spray(self, duration=2):
+        def _burst():
+            try:
+                start_cmd = {
+                    "event": "change_mode",
+                    "mode": "manual",
+                    "device_id": DEVICE_ID,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "stations": [{"station": STATION, "run_time": 1}]
+                }
+                stop_cmd = {
+                    "event": "change_mode",
+                    "mode": "off",
+                    "device_id": DEVICE_ID,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                }
+
+                # Path 1: Fast direct send on persistent warm socket
+                with self.lock:
+                    if self.is_connected and self.ws:
+                        self.ws.send(json.dumps(start_cmd))
+                        print(f"[B-HYVE] Spray ON (Station {STATION}) via active WS! Bursting {duration}s...", flush=True)
+                        time.sleep(duration)
+                        self.ws.send(json.dumps(stop_cmd))
+                        print(f"[B-HYVE] Spray OFF! Valve closed.", flush=True)
+                        return
+
+                # Path 2: Fallback on-demand connection if warm WS dropped
+                print("[B-HYVE] Active WS unavailable, initiating fallback connection...", flush=True)
+                res = requests.post(
+                    "https://api.orbitbhyve.com/v1/session",
+                    json={"session": {"email": BHYVE_EMAIL, "password": BHYVE_PASSWORD}},
+                    headers={"orbit-app-id": "Orbit Support Dashboard", "Content-Type": "application/json"},
+                    timeout=8
+                )
+                if res.status_code != 200:
+                    print(f"[B-HYVE ERROR] Auth failed: {res.status_code}", flush=True)
+                    return
+                token = res.json().get("orbit_api_key")
+                temp_ws = websocket.create_connection(f"wss://api.orbitbhyve.com/v1/events?token={token}", timeout=8)
+                temp_ws.send(json.dumps({"event": "app_connection", "orbit_session_token": token}))
+                temp_ws.send(json.dumps({"event": "subscribe", "devices": [DEVICE_ID]}))
+                time.sleep(0.3)
+                temp_ws.send(json.dumps(start_cmd))
+                print(f"[B-HYVE] Spray ON (Station {STATION}) via fallback! Bursting {duration}s...", flush=True)
+                time.sleep(duration)
+                temp_ws.send(json.dumps(stop_cmd))
+                print(f"[B-HYVE] Spray OFF! Valve closed.", flush=True)
+                time.sleep(0.3)
+                temp_ws.close()
+            except Exception as e:
+                print(f"[B-HYVE ERROR] Spray burst failed: {e}", flush=True)
+
+        threading.Thread(target=_burst, daemon=True).start()
+        return True
+
+
+# --- TAPO RTSP STREAM ---
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
+class RTSPStream:
+    def __init__(self, url):
+        self.url = url
+        self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.lock = threading.Lock()
+        self.running = True
+        self.frame = None
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self):
+        failed_count = 0
+        while self.running:
+            # Rapidly flush stale frames from buffer
+            if not self.cap.grab():
+                failed_count += 1
+                time.sleep(0.04)
+                if failed_count > 50:
+                    print("[RTSP] Stream stalled, reconnecting...", flush=True)
+                    self.cap.release()
+                    time.sleep(1.0)
+                    self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    failed_count = 0
+                continue
+
+            failed_count = 0
+            # Retrieve and decode only the latest frame
+            ret, frame = self.cap.retrieve()
+            if ret and frame is not None:
+                with self.lock:
+                    self.frame = frame
+
+    def read(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+
+alexa_enabled = True
+
+def trigger_alexa():
+    global alexa_enabled
+    if not alexa_enabled:
+        return
+
+    try:
+        url = "https://api-v3.voicemonkey.io/announce"
+        params = {
+            "token": VM_TOKEN,
+            "device": VM_DEVICE,
+            "speech": "Kill the bad bird"
+        }
+        res = requests.get(url, params=params, timeout=4)
+        if res.status_code == 200:
+            print("[ALEXA] Voice warning announced successfully.", flush=True)
+        elif res.status_code in [401, 402, 403, 429] or "credit" in res.text.lower() or "token" in res.text.lower():
+            alexa_enabled = False
+            print(f"[ALEXA SUSPENDED] Voice Monkey quota exhausted or unauthorized ({res.status_code}). Disabling Alexa alerts and falling back to B-hyve water deterrent only.", flush=True)
+        else:
+            print(f"[ALEXA] Voice Monkey responded: {res.status_code} {res.text}", flush=True)
+    except Exception as e:
+        print(f"[ALEXA ERROR] {e}", flush=True)
+
+def main():
+    print("[INFO] Starting Cockatoo & Galah Monitor with Color Discrimination...", flush=True)
+    bhyve = BHyveClient()
+    model = YOLO("yolov8n.pt")
+    stream = RTSPStream(RTSP_URL)
+    last_trigger = 0
+
+    while True:
+        # Operating window: 06:00 to 21:00 (9:00 PM)
+        now_hour = datetime.now().hour
+        if now_hour < 6 or now_hour >= 21:
+            print(f"[{datetime.now().strftime("%H:%M:%S")}] [NIGHT MODE] Outside active hours (06:00-21:00). Sleeping 60s...", flush=True)
+            time.sleep(60)
+            continue
+        frame = stream.read()
+        if frame is None:
+            time.sleep(0.05)
+            continue
+
+        h, w, _ = frame.shape
+        x1, y1 = int(FEEDER_ZONE[0]*w), int(FEEDER_ZONE[1]*h)
+        x2, y2 = int(FEEDER_ZONE[2]*w), int(FEEDER_ZONE[3]*h)
+        feeder_crop = frame[y1:y2, x1:x2]
+
+        results = model(feeder_crop, conf=CONF_THRESHOLD, verbose=False)
+        candidate_crops = []
+
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                label = model.names[cls_id]
+                conf = float(box.conf[0])
+                bx1, by1, bx2, by2 = [int(v) for v in box.xyxy[0].tolist()]
+                bw, bh = bx2 - bx1, by2 - by1
+
+                if label == 'bird':
+                    # Exclude bottom 18% to remove feet and grey feeder tray rim from color analysis
+                    effective_by2 = min(feeder_crop.shape[0], by1 + int(bh * 0.82))
+                    crop = feeder_crop[max(0, by1):effective_by2, max(0, bx1):min(feeder_crop.shape[1], bx2)]
+                    if crop.size > 0:
+                        if max(bw, bh) < 65:
+                            # Direct log for smaller safe visitors (lorikeets, rosellas)
+                            timestamp = datetime.now().strftime("%H:%M:%S")
+                            print(f"[{timestamp}] [SAFE BIRD] Small visitor ({label}, Conf: {conf:.2f}, Size: {bw}x{bh}px) - No trigger", flush=True)
+                        else:
+                            # Reject static objects like horizontal rails/trays (extreme aspect ratios)
+                            aspect_ratio = bw / max(1, bh)
+                            if aspect_ratio > 2.2:
+                                # Over 2.2x wider than tall is a ledge or tray, not a perched bird
+                                pass
+                            else:
+                                candidate_crops.append((crop, conf, label, bw, bh))
+
+        target_hit = False
+        target_type = None
+        cockatoo_candidate = None
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        for crop, conf, label, bw, bh in candidate_crops:
+            # --- BACKGROUND HARVESTER FOR CUSTOM AI CLASSIFIER ---
+            try:
+                pass
+                inbox_dir = os.path.expanduser("~/cockatoo_project/training_data/inbox")
+                if os.path.exists(inbox_dir):
+                    fname = f"{inbox_dir}/bird_{int(time.time()*100)}_{bw}x{bh}.jpg"
+                    cv2.imwrite(fname, crop)
+            except Exception:
+                pass
+
+            # --- CENTER-INSET SAMPLING (STRIP BACKGROUND TREES & SKY) ---
+            # Shave 20% margin from all 4 borders to evaluate only the bird core torso
+            ch, cw = crop.shape[:2]
+            pad_y = int(ch * 0.20)
+            pad_x = int(cw * 0.20)
+            core_crop = crop[pad_y:ch - pad_y, pad_x:cw - pad_x]
+            if core_crop.size == 0:
+                core_crop = crop
+
+            hsv = cv2.cvtColor(core_crop, cv2.COLOR_BGR2HSV)
+            total_pixels = core_crop.shape[0] * core_crop.shape[1]
+
+            # 1. White Plumage Mask (Cockatoos)
+            mask_white = cv2.inRange(hsv, np.array([0, 0, 115]), np.array([180, 75, 255]))
+            white_ratio = np.sum(mask_white > 0) / total_pixels
+
+            # 2. Yellow Crest Mask
+            mask_yellow = cv2.inRange(hsv, np.array([20, 80, 100]), np.array([35, 255, 255]))
+            yellow_pixels = int(np.sum(mask_yellow > 0))
+
+            # 3. Rose/Pink Plumage Mask (Galah Breast: Hue 145-172)
+            mask_rose = cv2.inRange(hsv, np.array([140, 35, 60]), np.array([176, 255, 255]))
+            pink_ratio = np.sum(mask_rose > 0) / total_pixels
+
+            # 4. Grey Feather Mask (Galah Back/Wings: Low Saturation, Mid Value)
+            mask_grey = cv2.inRange(hsv, np.array([0, 0, 60]), np.array([180, 50, 190]))
+            grey_ratio = np.sum(mask_grey > 0) / total_pixels
+
+            # 5. Crimson Red Mask (Rosella: Hue 0-10 and 175-180 only, saturated)
+            mask_red1 = cv2.inRange(hsv, np.array([0, 130, 80]), np.array([10, 255, 255]))
+            mask_red2 = cv2.inRange(hsv, np.array([175, 130, 80]), np.array([180, 255, 255]))
+            red_ratio = (np.sum(mask_red1 > 0) + np.sum(mask_red2 > 0)) / total_pixels
+
+            # 6. Green Plumage Mask (Rainbow Lorikeet Back/Wings)
+            mask_green = cv2.inRange(hsv, np.array([35, 80, 60]), np.array([85, 255, 255]))
+            green_ratio = np.sum(mask_green > 0) / total_pixels
+
+            # 7. Cobalt Blue Mask (Lorikeet Head / Rosella Cheeks)
+            mask_blue = cv2.inRange(hsv, np.array([95, 100, 60]), np.array([130, 255, 255]))
+            blue_ratio = np.sum(mask_blue > 0) / total_pixels
+
+            # ==========================================
+            # --- 5-BIRD DISCRIMINATION PIPELINE ---
+            # ==========================================
+            box_area = bw * bh
+            warm_breast_ratio = pink_ratio + red_ratio
+
+            # 1. IMMUNITY SHIELD: CRIMSON ROSELLA (Crimson Red + MANDATORY Cobalt Blue Cheeks)
+            # A Crimson Rosella in the wild ALWAYS has blue cheek patches (blue_ratio >= 0.007).
+            # A Galah has exactly 0.0% blue. Requiring blue completely stops Galahs from getting immunity.
+            is_rosella = (blue_ratio >= 0.007) and (red_ratio >= 0.015 or warm_breast_ratio >= 0.030) and (green_ratio < 0.10)
+            if is_rosella:
+                print(f"[{timestamp}] [SAFE BIRD - ROSELLA] (Red: {red_ratio:.1%}, Pink: {pink_ratio:.1%}, Grey: {grey_ratio:.1%}, Blue: {blue_ratio:.1%}, Size: {bw}x{bh}px) - Pass", flush=True)
+                continue
+
+            # 2. IMMUNITY SHIELD: LORIKEET (Vivid Green Back/Wings, Low Grey)
+            is_lorikeet = ((green_ratio >= 0.20) or (green_ratio >= 0.12 and blue_ratio >= 0.010)) and (grey_ratio < 0.28)
+            if is_lorikeet:
+                print(f"[{timestamp}] [SAFE BIRD - LORIKEET] (Green: {green_ratio:.1%}, Blue: {blue_ratio:.1%}, Size: {bw}x{bh}px) - Pass", flush=True)
+                continue
+
+            # 3. PEST CHECK: GALAH (Rose/Red Breast OR Silver-Grey Wings, STRICTLY ZERO BLUE)
+            # Front-facing: massive warm red/pink breast (>=6.0%) with 0% blue.
+            # Side/rear: silver-grey mantle (>=22.0%) with warm tones and 0% blue.
+            is_galah = (blue_ratio < 0.006) and ((warm_breast_ratio >= 0.060) or (grey_ratio >= 0.22 and warm_breast_ratio >= 0.025))
+            if is_galah and (bw >= 65 or bh >= 65):
+                target_hit = True
+                target_type = f"Galah ({bw}x{bh}px, Breast:{warm_breast_ratio:.1%}, Grey:{grey_ratio:.1%})"
+                cockatoo_candidate = (white_ratio, pink_ratio, target_type)
+                break
+
+            # 4. PEST CHECK: COCKATOO (Strictly Pure White + Yellow Crest, NO Red/Pink/Blue)
+            cockatoo_color_valid = (green_ratio < 0.015 and blue_ratio < 0.006 and red_ratio < 0.010 and pink_ratio < 0.012)
+            if yellow_pixels >= 250 and white_ratio >= 0.22 and cockatoo_color_valid:
+                target_hit = True
+                target_type = f"Cockatoo Crest ({yellow_pixels}px, W:{white_ratio:.1%})"
+            elif white_ratio >= 0.25 and (box_area >= 12000 or (bw >= 110 and bh >= 110)) and cockatoo_color_valid:
+                target_hit = True
+                target_type = f"Cockatoo ({bw}x{bh}px, W:{white_ratio:.1%})"
+            else:
+                continue
+
+            if target_hit:
+                cockatoo_candidate = (white_ratio, pink_ratio, target_type)
+                break
+
+        if target_hit and cockatoo_candidate is not None:
+            now = time.time()
+            if now - last_trigger > COOLDOWN_SECONDS:
+                print(f"\n[ALERT - {timestamp}] TARGET DETECTED: {target_type}! Triggering Sprinkler & Alexa...", flush=True)
+                hit_filename = f"/home/cameronlgreen/cockatoo_project/hit_{int(now)}.jpg"
+                cv2.imwrite(hit_filename, feeder_crop)
+                display_on_desktop(hit_filename)
+                
+                # Fire deterrents
+                bhyve.trigger_spray()
+                threading.Thread(target=trigger_alexa, daemon=True).start()
+                threading.Thread(target=send_telegram_alert, args=(hit_filename, f"🚨 Sprayed {target_type}"), daemon=True).start()
+                last_trigger = now
+
+        time.sleep(0.05)
+
+if __name__ == "__main__":
+    main()
