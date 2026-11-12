@@ -2,9 +2,12 @@ myenv/
 __pycache__/
 *.pyc
 debug_crops/
-alexa.disabled
-hit_*.jpg
-cockatoo_*.jpg
+trigger_photos/
 training_data/
 dataset/
 runs/
+*.tar.gz
+*.bak*
+hit_*.jpg
+cockatoo_*.jpg
+alexa.disabled

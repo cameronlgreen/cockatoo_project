@@ -13,8 +13,8 @@ BHYVE_EMAIL = os.environ.get("BHYVE_EMAIL", "cameron@green.net.au")
 BHYVE_PASSWORD = os.environ.get("BHYVE_PASSWORD", "Cockatoo1234!")
 BHYVE_DEVICE_ID = "66f4ce315e9a4f66453d7122"
 STATION = 3
-BURST_SECONDS = 3.0
-COOLDOWN_SECONDS = 35.0
+BURST_SECONDS = 3.5
+COOLDOWN_SECONDS = 15.0
 
 TELEGRAM_TOKEN = "8542046011:AAGixULwPxZWBesqY2jjI7XndeKMbA67Avk"
 TELEGRAM_CHAT_ID = "7087305671"
@@ -141,10 +141,14 @@ def display_on_desktop(img_path):
     def _show():
         try:
             import subprocess
+            from datetime import datetime
+            ts_label = datetime.now().strftime("%d %b %H:%M:%S")
             cmd = [
                 "/usr/bin/python3", "-c",
                 f"import cv2; "
                 f"img = cv2.imread('{img_path}'); "
+                f"cv2.putText(img, '{ts_label}', (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 4, cv2.LINE_AA); "
+                f"cv2.putText(img, '{ts_label}', (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA); "
                 f"cv2.namedWindow('Cockatoo Alert', cv2.WINDOW_NORMAL); "
                 f"cv2.resizeWindow('Cockatoo Alert', 400, 300); "
                 f"cv2.moveWindow('Cockatoo Alert', 1500, 30); "
@@ -182,6 +186,19 @@ class RTSPStream:
         with self.lock:
             return None if self.frame is None else self.frame.copy()
 
+def trigger_tapo_siren(duration=2.5):
+    try:
+        from pytapo import Tapo
+        cam = Tapo("192.168.1.147", "cameron.l.green@bigpond.com", "CgT31473147O#")
+        cam.startManualAlarm()
+        time.sleep(duration)
+        cam.stopManualAlarm()
+        print(f"[TAPO SIREN] Fired {duration}s local camera alarm.", flush=True)
+    except Exception as e:
+        if "Temporary Suspension" in str(e):
+            print("[TAPO SIREN] Camera API locked out (rate limited). Skipping siren.", flush=True)
+        else:
+            print(f"[TAPO SIREN ERROR] {e}", flush=True)
 def main():
     detector = YOLO(DETECTOR_MODEL_PATH)
     classifier = YOLO(CLASSIFIER_MODEL_PATH)
@@ -192,6 +209,9 @@ def main():
     last_trigger = 0.0
     last_safe_bird_time = 0.0
     consecutive_target_hits = 0
+    target_first_seen_time = None
+    last_bird_seen_time = 0.0
+    interim_audio_fired = False
 
     while True:
         now_dt = datetime.now()
@@ -254,6 +274,13 @@ def main():
 
             candidates.append({"name": top1, "conf": top1_c, "dims": (bw, bh)})
 
+        if len(candidates) > 0:
+            last_bird_seen_time = now
+            if target_first_seen_time is None:
+                target_first_seen_time = now
+        elif (now - last_bird_seen_time) > 2.0:
+            target_first_seen_time = None
+
         if frame_has_safe:
             last_safe_bird_time = now
             consecutive_target_hits = 0
@@ -282,17 +309,27 @@ def main():
                 continue
             if (now - last_trigger) > COOLDOWN_SECONDS:
                 consecutive_target_hits = 0
-                last_trigger = now
                 sp, cf = target["name"], target["conf"]
+                reaction_time = (now - target_first_seen_time) if target_first_seen_time else 0.0
+                print(f"[{ts}] [BENCHMARK] Elapsed arrival-to-spray: {reaction_time:.2f}s", flush=True)
                 print(f"[{ts}] [ALERT] TARGET: {sp.upper()} ({cf*100:.1f}%)! SPRAYING...", flush=True)
                 bhyve.trigger_spray(duration=BURST_SECONDS)
+                last_trigger = time.time()
+                target_first_seen_time = None
+                interim_audio_fired = False
                 hit_path = os.path.join(TRIGGER_DIR, f"hit_{datetime.now().strftime('%d%b_%H-%M-%S')}_{sp}.jpg")
                 cv2.imwrite(hit_path, feeder_roi)
                 threading.Thread(target=trigger_alexa, daemon=True).start()
-                threading.Thread(target=send_telegram_alert, args=(hit_path, f"🚨 Sprayed {sp.upper()} ({cf*100:.1f}%)"), daemon=True).start()
+                threading.Thread(target=send_telegram_alert, args=(hit_path, f"🚨 Sprayed {sp.upper()} ({cf*100:.1f}%) | Delay: {reaction_time:.2f}s"), daemon=True).start()
                 display_on_desktop(hit_path)
             else:
-                print(f"[{ts}] [COOLDOWN] Target present but valve cooling down ({COOLDOWN_SECONDS - (now - last_trigger):.1f}s left).", flush=True)
+                elapsed_since_spray = now - last_trigger
+                remaining = COOLDOWN_SECONDS - elapsed_since_spray
+                print(f"[{ts}] [SUSTAINED PRESENCE] Target lingering on tray ({remaining:.1f}s until next burst).", flush=True)
+                if elapsed_since_spray > (BURST_SECONDS + 4.0) and not interim_audio_fired:
+                    interim_audio_fired = True
+                    print(f"[{ts}] [HARASSMENT] Bird stayed post-spray -> firing Tapo camera siren...", flush=True)
+                    threading.Thread(target=trigger_tapo_siren, args=(2.0,), daemon=True).start()
 
         time.sleep(0.04)
 
