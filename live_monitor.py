@@ -118,10 +118,17 @@ class BHyveWS:
 bhyve = BHyveWS()
 
 def trigger_alexa():
+    mute_file = "/home/cameronlgreen/cockatoo_project/alexa.disabled"
+    if os.path.exists(mute_file):
+        print("[ALEXA] Voice alerts muted via toggle.", flush=True)
+        return
     try:
-        requests.get(f"https://api-v2.voicemonkey.io/trigger?token={VM_TOKEN}&device={VM_DEVICE}", timeout=5)
-    except Exception:
-        pass
+        url = "https://www.virtualsmarthome.xyz/url_routine_trigger/activate.php?trigger=213a4ffc-9a2b-4b50-af9d-59aa09899ff6&token=1727a699-41a9-4d85-9e4e-74fa1938e3c9&response=html"
+        requests.get(url, timeout=5)
+        print("[ALEXA] Free Virtual Smart Home trigger dispatched successfully.", flush=True)
+    except Exception as e:
+        print(f"[ALEXA ERROR] {e}", flush=True)
+
 
 def send_telegram_alert(img_path, caption):
     try:
@@ -134,11 +141,25 @@ def display_on_desktop(img_path):
     def _show():
         try:
             import subprocess
-            cmd = ["/usr/bin/python3", "-c", f"import cv2; img=cv2.imread('{img_path}'); cv2.namedWindow('Cockatoo Alert', cv2.WINDOW_NORMAL); cv2.resizeWindow('Cockatoo Alert', 800, 600); cv2.imshow('Cockatoo Alert', img); cv2.waitKey(0); cv2.destroyAllWindows()"]
-            subprocess.run(cmd, env={"DISPLAY": ":0", "XAUTHORITY": "/home/cameronlgreen/.Xauthority"})
-        except Exception:
-            pass
+            cmd = [
+                "/usr/bin/python3", "-c",
+                f"import cv2; "
+                f"img = cv2.imread('{img_path}'); "
+                f"cv2.namedWindow('Cockatoo Alert', cv2.WINDOW_NORMAL); "
+                f"cv2.resizeWindow('Cockatoo Alert', 400, 300); "
+                f"cv2.moveWindow('Cockatoo Alert', 1500, 30); "
+                f"cv2.imshow('Cockatoo Alert', img); "
+                f"cv2.waitKey(0);"
+            ]
+            subprocess.run(
+                cmd,
+                env={"DISPLAY": ":0", "XAUTHORITY": "/home/cameronlgreen/.Xauthority"}
+            )
+        except Exception as e:
+            print(f"[DISPLAY ERROR] {e}", flush=True)
+
     threading.Thread(target=_show, daemon=True).start()
+
 
 class RTSPStream:
     def __init__(self, url):
@@ -155,11 +176,11 @@ class RTSPStream:
                 with self.lock:
                     self.frame = f
             else:
-                time.sleep(0.05)
+                time.sleep(0.04)
 
     def read(self):
         with self.lock:
-            return self.frame.copy() if self.frame is not None else None
+            return None if self.frame is None else self.frame.copy()
 
 def main():
     detector = YOLO(DETECTOR_MODEL_PATH)
@@ -170,6 +191,7 @@ def main():
 
     last_trigger = 0.0
     last_safe_bird_time = 0.0
+    consecutive_target_hits = 0
 
     while True:
         now_dt = datetime.now()
@@ -234,6 +256,7 @@ def main():
 
         if frame_has_safe:
             last_safe_bird_time = now
+            consecutive_target_hits = 0
             print(f"[{ts}] [SAFE BIRD VETO] {safe_msg} - Suppressed.", flush=True)
             time.sleep(0.1)
             continue
@@ -249,8 +272,16 @@ def main():
                 target = cand
                 break
 
+        if not target:
+            consecutive_target_hits = 0
+
         if target:
+            consecutive_target_hits += 1
+            if consecutive_target_hits < 2:
+                time.sleep(0.04)
+                continue
             if (now - last_trigger) > COOLDOWN_SECONDS:
+                consecutive_target_hits = 0
                 last_trigger = now
                 sp, cf = target["name"], target["conf"]
                 print(f"[{ts}] [ALERT] TARGET: {sp.upper()} ({cf*100:.1f}%)! SPRAYING...", flush=True)

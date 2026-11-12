@@ -5,3 +5,6 @@ debug_crops/
 alexa.disabled
 hit_*.jpg
 cockatoo_*.jpg
+training_data/
+dataset/
+runs/
