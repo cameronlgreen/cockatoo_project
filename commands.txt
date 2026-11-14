@@ -1,0 +1,58 @@
+================================================================
+RASPBERRY PI — COCKATOO MONITOR & SYSTEM COMMANDS
+================================================================
+
+1. Stream live systemd logs for the active monitor service:
+   journalctl -u cockatoo_monitor.service -f
+
+2. Restart, stop, start, or check status of the monitor service:
+   sudo systemctl restart cockatoo_monitor.service
+   sudo systemctl stop cockatoo_monitor.service
+   sudo systemctl start cockatoo_monitor.service
+   sudo systemctl status cockatoo_monitor.service
+
+3. Tail local B-hyve and monitor debug logs:
+   tail -f ~/cockatoo_project/bhyve_debug.log ~/cockatoo_project/monitor.log
+
+4. Check running monitor processes (verify no duplicates):
+   pgrep -af live_monitor.py
+
+5. Close stuck OpenCV alert windows manually:
+   pkill -f "Cockatoo Alert"
+
+6. Check Pi RAM, swap, voltage throttling, and temperature:
+   free -h && vcgencmd get_throttled && vcgencmd measure_temp
+
+7. Check mounted USB drive paths and run auto-crop:
+   lsblk -o NAME,MOUNTPOINT
+   python ~/cockatoo_project/auto_crop.py
+
+8. Inspect recent trigger photos or King Parrot captures:
+   ls -lt ~/cockatoo_project/trigger_photos | head -n 10
+   ls -lt ~/cockatoo_project/king_parrot_visits | head -n 10
+
+
+================================================================
+WINDOWS POWERSHELL — UV PHOTO REPAIR COMMANDS (K:\)
+================================================================
+
+1. Install required Python libraries (OpenCV & NumPy):
+   python -m pip install opencv-python numpy
+
+2. Run the 20-photo interactive repair studio (box-fade + global sliders):
+   python "$HOME\uv_master_tuner.py"
+
+3. Run the row-matched box-fade repair tool:
+   python "$HOME\horizon_box_repair.py"
+
+4. Run the automated batch UV repair across K:\Cropped:
+   python "$HOME\fix_uv.py"
+
+5. Run the single-photo seamless Poisson blend test:
+   python "$HOME\seamless_test.py"
+
+6. Save clipboard code directly into a Python script file:
+   Get-Clipboard | Set-Content -Path "$HOME\script_name.py" -Encoding UTF8
+
+7. Search for files on the K: USB drive:
+   Get-ChildItem -Path "K:\" -Filter "*cam01112026*" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName

@@ -1,0 +1,17 @@
+nohup: ignoring input
+[B-HYVE] Direct on-demand trigger engine ready (with wake-up retry & logging).
+[INFO] Two-stage pipeline and shield active.
+[10:08:19] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:08:20] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:08:22] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:08:22] [SAFE BIRD VETO] Primary is LORIKEET (99.9%) - Suppressed.
+[10:08:30] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:08:31] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:08:39] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:08:39] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:08:48] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:09:36] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:09:36] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:09:36] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+[10:09:37] [SAFE BIRD VETO] Primary is LORIKEET (100.0%) - Suppressed.
+Terminated
